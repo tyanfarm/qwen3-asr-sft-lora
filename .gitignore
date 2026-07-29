@@ -1,0 +1,12 @@
+.env
+data/
+checkpoints/
+results/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
+eval_result_test/
+results_run1/
+tests/
+venv

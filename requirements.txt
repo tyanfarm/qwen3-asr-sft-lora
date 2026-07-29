@@ -1,0 +1,21 @@
+# Install torch/torchaudio FIRST with the cu128 wheels (Blackwell / RTX 5080):
+#   pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+# Then: pip install -r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128
+# qwen3_asr model support requires transformers >= 5.14 (added after 5.5.x)
+transformers>=5.14.1
+peft>=0.14.0
+accelerate>=1.2.0
+datasets>=3.2.0
+huggingface_hub>=0.27.0
+librosa>=0.10.2
+soundfile>=0.12.1
+jiwer>=3.0.4
+numpy>=1.26,<2.2
+pandas>=2.2.0
+python-dotenv>=1.0.1
+ipywidgets>=8.1.0
+tqdm>=4.67.0
+pytest>=8.3.0
