@@ -7,6 +7,12 @@ __pycache__/
 .ipynb_checkpoints/
 .pytest_cache/
 eval_result_test/
+asr_inference/models/
 results_run1/
 tests/
-venv
+venvrun_3ds.log
+models/
+.claude/
+venv/
+*.log
+audio_test/

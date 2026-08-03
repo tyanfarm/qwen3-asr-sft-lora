@@ -116,11 +116,21 @@ def duration_s(array, sr: int) -> float:
 # --- streaming loader (network) --------------------------------------------- #
 def stream_rows(repo: str, split: str, config: str | None = None,
                 text_column: str | None = None, token: str | None = None,
-                limit: int | None = None, shuffle_seed: int | None = None):
-    """Yield ``{"array", "text", "duration"}`` from an HF audio dataset, 16 kHz.
+                limit: int | None = None, shuffle_seed: int | None = None,
+                extra_columns: tuple = ()):
+    """Yield ``{"array", "text", "duration", "path"}`` from an HF audio dataset, 16 kHz.
 
     Streams, so a subsampled source never downloads the full corpus. Shared by
     the benchmark loader and the training mixture.
+
+    ``path`` is the in-archive filename (``""`` when the source does not carry
+    one). Most callers ignore it; ``corpora.py`` needs it because VietSpeech
+    encodes its recording id in the filename and has no speaker column.
+
+    ``extra_columns`` names source columns to pass through untouched — how
+    ``corpora.py`` gets VieNeu's ``speaker`` field. Missing names yield ``None``
+    rather than raising, so a source that drops a column degrades to "no
+    grouping signal" instead of killing a multi-hour build.
     """
     from datasets import Audio, load_dataset
 
@@ -139,12 +149,17 @@ def stream_rows(repo: str, split: str, config: str | None = None,
         ds = ds.take(limit)
 
     for row in ds:
-        arr, sr = data_prep._decode_audio(row[audio_col])
+        entry = row[audio_col]
+        arr, sr = data_prep._decode_audio(entry)
         if sr != TARGET_SR:
             arr = data_prep._resample(arr, sr, TARGET_SR)
             sr = TARGET_SR
-        yield {"array": arr, "text": row[text_col],
-               "duration": duration_s(arr, sr)}
+        out = {"array": arr, "text": row[text_col],
+               "duration": duration_s(arr, sr),
+               "path": (entry.get("path") or "") if isinstance(entry, dict) else ""}
+        for col in extra_columns:
+            out[col] = row.get(col)
+        yield out
 
 
 def iter_bench(name: str, token: str | None = None, limit: int | None = None,

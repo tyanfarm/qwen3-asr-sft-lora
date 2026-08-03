@@ -13,12 +13,128 @@ on Vietnamese audio from the [`capleaf/viVoice`](https://huggingface.co/datasets
 | `vi_norm.py` | Vietnamese text normalization + `wer_cer`, shared by both notebooks and `show_results.py`. |
 | `bench.py` | Registry + streaming loader for the external benchmarks (VIVOS, Common Voice 17 `vi`, VLSP 2020) evaluated in section 8 of notebook 1, plus the shared batched-transcription helper. |
 | `mixture.py` | Builds the multi-source **training** mixture at `data/vi_mix/` (viVoice + VIVOS + Common Voice + VLSP 2020) and the hash-assigned held-out slices. |
+| `corpora.py` | The **large-corpus track**: streams viVoice / VietSpeech / VieNeu-TTS-1000h into `data/corpora/<name>/`, each with its own speaker- or recording-disjoint `train/val/test`. Used by notebooks 3–4. |
+| `03_eval_baseline_3ds.ipynb` | Baseline WER/CER of the stock model on each of the three large corpora's held-out test splits. |
+| `04_lora_finetune_3ds.ipynb` | LoRA fine-tune on the three corpora combined; before/after WER **per corpus**, with a bootstrap significance test. |
+| `run_3ds.py` | Unattended driver: builds all three corpora (100 h each by default), then executes notebooks 3 and 4 in place. Resumable — re-run to pick up after a failure. |
+| `context/MERGING.md` | How to fold a trained adapter back into the base model: the fp32/fp16 precision reasoning, the two verification checks, and what changes when publishing full weights instead of an adapter. |
+| `context/LONG_AUDIO_EVAL.md` | The long-audio test case to run after a fine-tune: scoring the merged 5–60 s viVoice split with `eval_lora.py`, why a short-clip run like notebook 4 needs it, and the leakage check that must come first. |
 | `eval_lora.py` | Scores a saved adapter on any cached split, in the notebooks' output format. Used for the 1250-clip raw viVoice split, which notebook 2 does not evaluate. |
 | `show_results.py` | Pretty-prints the saved metrics and the worst/best predictions, LoRA beside baseline. |
 | `tests/test_data_prep.py` | Unit tests for the duration bucketing and channel-disjoint splitting (no GPU/network). |
 | `tests/test_vi_norm.py` | Unit tests for the number normalization and WER metric (no GPU/network). |
 | `tests/test_bench.py` | Unit tests for the benchmark registry and batching helpers (no GPU/network). |
 | `tests/test_mixture.py` | Unit tests for the mixture registry, hash splitting, transcript casing and cache versioning (no GPU/network). |
+| `tests/test_corpora.py` | Unit tests for the large-corpus registry, filename-based channel derivation, clip filtering and split disjointness (no GPU/network). |
+
+### Two tracks
+
+Notebooks 1–2 and 3–4 answer different questions and do not share caches beyond
+`data/vi_asr/`:
+
+| | notebooks 1–2 (`mixture.py`) | notebooks 3–4 (`corpora.py`) |
+|---|---|---|
+| training data | ~34 h blend of 4 sources, one mixed `train` | 3 large corpora, concatenated but each keeping its own splits |
+| what is held out | viVoice `test` only; VIVOS/CMV/VLSP become **in-domain** | every corpus's own test split — **all three stay held-out** |
+| the question | does a small curated blend beat the stock model | does *more data* from three 1000 h corpora move each one's WER |
+
+### The three large corpora (notebooks 3–4)
+
+| corpus | source | size | character | how it is split |
+|---|---|---|---|---|
+| `vivoice` | [`capleaf/viVoice`](https://huggingface.co/datasets/capleaf/viVoice) | 8.4 h slice | YouTube, 5–60 s merged segments | reuses `data/vi_asr/`, by `channel` |
+| `vivoice_full` | [`capleaf/viVoice`](https://huggingface.co/datasets/capleaf/viVoice) | ~1,000 h | YouTube, native unmerged clips | by `channel` |
+| `vietspeech` | [`NhutP/VietSpeech`](https://huggingface.co/datasets/NhutP/VietSpeech) | ~1,100 h | social media, 2–6 s, 3 regional accents | by the recording prefix in its filenames |
+| `vieneu` | [`pnnbao-ump/VieNeu-TTS-140h`](https://huggingface.co/datasets/pnnbao-ump/VieNeu-TTS-140h) | ~140.7 h | studio TTS read speech, 193 voices | by voice (`speaker` with its recording suffix stripped) |
+
+All three are gated on the Hub; `viVoice` and `VieNeu-TTS-140h` are gated `auto`
+(accept the terms on the dataset page), `VietSpeech` likewise. `corpora.check_access`
+probes each one by pulling a single row and `corpora.prepare_all` skips anything
+unreachable with a printed reason, so notebooks 3–4 always run end to end.
+
+**On the two VieNeu releases.** The 140 h release is used, not the 1000 h sibling:
+the latter is gated `manual` and its authors restrict it to institutions, research
+labs and universities, and this project's request is still awaiting review (every
+file resolves `403`). The 140 h release is the same corpus shape. It ships **both**
+`text` (ordinary Vietnamese) and `phonemized_text` (IPA); `corpora.py` pins the
+text column to `text`, because training on phonemes would optimise a target the
+WER metric never sees. Its audio is 24 kHz and is resampled to 16 kHz on ingest.
+
+**Why viVoice has two entries.** `data_prep`'s merged build materialises every
+decoded clip in RAM before writing (`clips = list(_stream_clips(...))`) — roughly
+230 GB at 1,000 h — so it cannot scale past the 8 h cache. `vivoice_full` streams
+and writes incrementally, holding only metadata. The cost is that clips arrive
+unmerged, so there are no 5–60 s long-form segments. Use `vivoice` when you want a
+number comparable to notebooks 1–2; use `vivoice_full` when you want the corpus.
+
+### Running the whole thing unattended
+
+`run_3ds.py` builds the corpus caches and then executes notebooks 3 and 4 in
+place, because the run is measured in hours and a Jupyter kernel is the wrong
+place to hold it. Each corpus is built separately, so a failure costs one corpus
+rather than the set, and completed corpora are stamped and skipped — just re-run
+to resume. A failed corpus is retried up to 3 times before it is given up on:
+an earlier whole-corpus run lost 829 h of streamed viVoice to a single transient
+`RuntimeError: Cannot send a request, as the client has been closed`.
+
+```bash
+nohup python3 -u run_3ds.py > run_3ds.log 2>&1 &   # build, then notebook 3, then 4
+python3 run_3ds.py --build                          # build only
+```
+
+**How much of each corpus.** `TARGET_HOURS` in `run_3ds.py` and
+`HOURS_PER_CORPUS` in notebooks 3 and 4 must agree — the caches are shared, and
+the cache stamp records the hours it was built at so a mismatch rebuilds rather
+than silently training at one scale and scoring at another. The default is
+**100 h per corpus, 300 h total**. Measured on this box:
+
+| stage | rate | 300 h (default) | ~2,240 h (`None`) |
+|---|---|---|---|
+| download + cache | 74 audio-hours per wall-hour | **~4 h**, ~35 GB | **~30 h**, ~258 GB |
+| training (batch 8) | 9.82 examples/s | **~5 h**, ~185k examples | **~33 h**, ~1.4M examples |
+
+An equal cap per corpus is also a balance decision, not only a budget one. The
+three differ in size by 8x (viVoice ~1,000 h, VietSpeech ~1,100 h, VieNeu
+140.7 h), so taking them in full would let the two big ones account for 94% of
+the gradient and round VieNeu's clean read speech away.
+
+Cached audio costs a measured **115 MB per hour** of 16 kHz PCM_16 wav. Batch size
+is the decision that matters: at the old `per_device_train_batch_size=1` the 300 h
+epoch takes 36 h instead of 5 — so notebook 4 uses batch 8 × accum 2, keeping the
+effective batch at 16 so the run-2 recipe is otherwise unchanged.
+
+### Why the split keys are what they are
+
+A random clip-level split would put neighbouring clips from one recording in both
+train and test, reporting a WER far better than the model earns. None of the three
+ships an official test split, so `corpora.py` builds them — never at the clip level.
+
+- **VietSpeech** has only `audio` and `transcription`, no speaker column. Its
+  filenames are `<recording>_<clip>.wav`; a 3,000-row sample gave 487 distinct
+  prefixes with up to 40 clips each, so the prefix groups clips by source
+  recording. Weaker than true speaker-disjointness (one speaker may appear under
+  several recordings) but it removes the dominant leak.
+- **VieNeu** *has* a `speaker` column, but it holds one id per **recording**
+  (`jellyfish1010_0041`, `jellyfish1010_0052`) while the card counts only 193
+  voices across 74,858 clips. Grouping on it directly would put one voice in both
+  train and test, so `channel_strip_suffix` drops the trailing index first.
+
+**VieNeu's voice count is shard-bound, not hour-bound.** Its 193 voices sit
+contiguously across 49 shards — about 4 voices per 2.9 h shard. Measured: a 0.4 h
+build saw 4 voices and a **3 h build saw 5**. Raising `HOURS_PER_CORPUS` buys clips
+much faster than it buys speakers, and since the split is speaker-disjoint it is
+*voice* count that decides whether the test WER means anything. Budget roughly 3 h
+per extra voice, and read a VieNeu test WER built on a couple of voices as
+describing those speakers rather than the corpus. The 100 h default covers ~35 of
+the 49 shards, so it clears this trap comfortably; it is small builds that don't.
+
+`corpora.allocate_channels` exists for exactly this: plain 80/10/10 rounding drops
+`val` to zero once channels are few, and an empty split is unloadable (`datasets`
+throws a bare `IndexError` from inside `concat_tables`, hours after the cause). It
+guarantees val and test at least one channel each, refuses below 3, and does **not**
+touch `data_prep.split_by_channel` — that function's exact output defines the
+viVoice splits notebooks 1–2 already published against. `prepare_corpus` also warns
+under 10 channels, and notebook 3 prints per-split channel counts.
 
 ### Scoring note — numbers
 
