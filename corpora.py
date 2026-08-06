@@ -1,9 +1,9 @@
-"""Three large Vietnamese speech corpora, cached on one schema.
+"""Four large Vietnamese speech corpora, cached on one schema.
 
 ``data_prep.py`` handles viVoice specifically and ``mixture.py`` assembles the
 small multi-source mixture used by notebooks 1-2. This module is for the
-*large-corpus* track (notebooks 3-4): viVoice, VieNeu-TTS-1000h and VietSpeech,
-each streamed to a capped number of hours, split into train/val/test, and
+*large-corpus* track (notebooks 3-4): viVoice, VietSpeech, VieNeu-TTS-140h and
+Bud500, each streamed to a capped number of hours, split into train/val/test, and
 written in exactly the record schema ``data_prep`` uses -- ``audio_path``,
 ``text``, ``duration``, ``channel``, ``bucket``, plus ``source``. That means
 ``data_prep.load_splits``, ``data_prep.read_audio`` and the notebooks' collator
@@ -14,12 +14,16 @@ Why a separate module from ``mixture.py``
 ``mixture.py`` builds one blended training set and holds out slices of *public
 benchmarks*. Here each corpus keeps its own train/val/test so the fine-tune can
 be scored per corpus -- the question these notebooks ask is "does more data from
-these three sources move each corpus's own held-out WER", which needs three
+these four sources move each corpus's own held-out WER", which needs four
 separate test sets, not one blend.
 
 Keeping the test splits honest
 ------------------------------
-None of the three ships an official test split, so every split is built here.
+Every split is built here. Three of the four ship no official test split at all;
+Bud500 does, but its splits are not used either, because the hour cap means only
+a fraction of the corpus is taken and val/test must be drawn from the same slice
+the training hours came from.
+
 The rule is *never split at the clip level*: consecutive clips from one
 recording share a speaker, a room and a topic, so a random clip-level split
 leaks the test set into training and reports a WER that is far too good.
@@ -34,10 +38,35 @@ leaks the test set into training and reports a WER that is far too good.
   prefix groups clips by source recording. Splitting on it is weaker than true
   speaker-disjointness (one speaker may appear under several recordings) but it
   removes the dominant leak, which is same-recording neighbours.
-* **VieNeu** carries a real ``speaker`` column, but it holds one id *per
-  recording* (``jellyfish1010_0041``), not per voice -- the card counts 193
-  voices across 74,858 clips. ``channel_strip_suffix`` drops the trailing index
-  so all of one voice's recordings share a channel and cannot straddle splits.
+* **VieNeu** carries a real ``speaker`` column and it is already one id per
+  voice, so it is used as-is. The trailing number in ``jellyfish1010_0041`` looks
+  like a recording index but is part of the identity: counted over the cached
+  shards, the column holds **193 distinct values across 74,858 clips**, matching
+  the card's 193 voices exactly. Stripping it (the earlier setting) collapsed all
+  193 into 5 base names, two of which held 96% of the clips -- 100 h then split
+  59/1/41 with a single voice on each side of the train/test line.
+* **Bud500** is the exception: it carries no grouping signal at all. The repo has
+  exactly two columns, ``audio`` and ``transcription``, and the audio struct's
+  ``path`` is ``None``, so there is no filename to fall back on. Nor is the shard
+  index a proxy -- the corpus ships pre-shuffled at the clip level, verified by
+  reading 16 consecutive rows and getting 16 unrelated sentences. Its splits
+  therefore fall back to the transcript hash, which keeps a repeated sentence out
+  of two splits but lets one speaker appear on both sides. **Read its test WER as
+  optimistic.** It earns its place in the mixture on its 100 h of training audio,
+  not on its number; the other three keep their channel-disjoint splits and are
+  what the before/after comparison should rest on.
+
+On Bud500's clip length
+-----------------------
+Its clips are fixed-length chunks rather than sentences -- transcripts cut
+mid-phrase (``các vấn đề y học chuyên khoa hoặc ứng``). Measured over 120 clips:
+mean **2.55 s**, median 2.51, max 4.46. Two consequences worth holding onto.
+First, 100 h of Bud500 is ~141,000 clips where 100 h of viVoice is 86,865, so at
+equal *hours* it contributes ~37% of the training *examples* -- and gradient
+steps are counted per example. Second, every clip lands in the ``0-5`` duration
+bucket, which is exactly where the 34 h adapter regressed (4.77% -> 5.13%). If
+short-clip WER is the thing being fixed, that is the point; if it is not, cap
+Bud500 lower than the others rather than raising the others to match.
 
 On the two VieNeu releases
 --------------------------
@@ -101,6 +130,19 @@ MAX_CLIP_S = 60.0
 # the corpus. See the notebooks for what that does to the duration mixture.
 MIN_CLIP_S = 0.5
 
+# Fetch whole shard files in parallel instead of holding one long streaming read
+# open. Set False to go back to `bench.stream_rows`.
+#
+# This is on because the streaming read is not merely slower, it is fatal on a
+# connection reset: the reset closes the httpx client and the library's own retry
+# then dies on it. Three consecutive 100 h viVoice builds were lost that way in
+# under two hours. `bench.stream_shards` has the full diagnosis.
+#
+# The cost is that shards land in the HF cache rather than passing through: ~46
+# GB for the 300 h configuration, on top of the ~35 GB of wav output. Worth it
+# to make a reset cost one file instead of the corpus.
+PREFETCH_SHARDS = True
+
 
 @dataclass(frozen=True)
 class Corpus:
@@ -160,7 +202,10 @@ CORPORA: dict[str, Corpus] = {
         # is the wrong target -- this model is scored on words, not phonemes.
         text_column="text",
         channel_column="speaker",
-        channel_strip_suffix=True,
+        # Off: `speaker` is already per-voice. Measured over the cached shards,
+        # the raw column has 193 distinct values -- the card's voice count --
+        # while stripping the trailing _NNNN leaves 5. See the module docstring.
+        channel_strip_suffix=False,
         # The stream is ordered by voice, so a contiguous prefix is a handful of
         # speakers: a 0.4 h probe gave 222 clips across 4 voices and an empty val
         # split. Shuffling randomises shard order, so the hour budget is drawn
@@ -173,8 +218,31 @@ CORPORA: dict[str, Corpus] = {
         note=("pnnbao-ump/VieNeu-TTS-140h, 74,858 studio TTS clips (~140.7 h, "
               "193 voices, 24 kHz -> resampled to 16 kHz). Gated 'auto', so "
               "accepting the terms on the dataset page is enough. Split by "
-              "voice (the `speaker` column with its per-recording suffix "
-              "stripped)."),
+              "voice on the raw `speaker` column, which holds exactly those "
+              "193 ids."),
+    ),
+    "bud500": Corpus(
+        repo="linhtran92/viet_bud500",
+        split="train",
+        text_column="transcription",
+        # Neither channel option is set, and that is not an oversight: the repo
+        # ships `audio` and `transcription` and nothing else, and the audio
+        # struct's `path` is None, so `channel_from_path` would read an empty
+        # string for every row and collapse the corpus to one channel. With no
+        # signal, `split_records` falls back to the transcript hash. See the
+        # module docstring for what that costs and why it is accepted here.
+        #
+        # Off deliberately: the corpus arrives already shuffled at the clip
+        # level, so a contiguous prefix of shards is a representative sample.
+        # Shuffling again would only pay for a 1,000-row buffer per shard.
+        shuffle=False,
+        gated=True,
+        note=("linhtran92/viet_bud500, ~500 h of Vietnamese YouTube speech cut "
+              "into fixed-length chunks (mean 2.55 s, none over 5 s), native "
+              "16 kHz, lowercase and unpunctuated. Gated 'auto'. NOT "
+              "speaker-disjoint: the repo carries no speaker column and no "
+              "filenames, so it is split by transcript hash and its test WER "
+              "reads optimistic — it is here for its training hours."),
     ),
 }
 
@@ -326,6 +394,24 @@ def cached_stamp(base: str) -> tuple[int, str | None]:
         return 0, None
 
 
+def cache_is_complete(name: str, target_hours: float | None,
+                      root: str = "data/corpora") -> bool:
+    """Is there a cache on disk this build would reuse untouched?
+
+    One definition, two callers: ``prepare_corpus`` decides whether to rebuild,
+    and ``prepare_all`` decides whether the corpus needs the network at all. A
+    complete cache needs neither, and treating those as the same question is
+    what stops a reachability failure from discarding 11 GB of built corpus.
+    """
+    if not all(os.path.exists(os.path.join(p, "dataset_info.json"))
+               for p in split_paths(name, root).values()):
+        return False
+    if CORPORA[name].repo is None:      # prebuilt (viVoice): no stamp to match
+        return True
+    have, have_hours = cached_stamp(corpus_dir(name, root))
+    return have == CORPUS_VERSION and have_hours == hours_tag(target_hours)
+
+
 # --- access probing --------------------------------------------------------- #
 def check_access(name: str, token: str | None = None) -> tuple[bool, str]:
     """Try to pull a single row; return ``(ok, message)``.
@@ -335,6 +421,17 @@ def check_access(name: str, token: str | None = None) -> tuple[bool, str]:
     does. Pulling one row is the cheapest honest check, and it is what lets the
     notebooks skip an unapproved corpus with an explanation rather than dying
     an hour into a build.
+
+    The row is fetched **undecoded**. The probe asks one question -- can this
+    process pull bytes out of this repo -- and decoding answers a different one,
+    through torchcodec+FFmpeg, which no other read in the project performs
+    (``bench`` casts the same column to ``decode=False`` before every read).
+    Keeping the decoder out of it also keeps the probe from being stricter than
+    the build it guards: on 2026-08-04 a kernel where ``datasets`` resolved
+    ``TORCHCODEC_AVAILABLE`` to False failed this probe on exactly the two repos
+    that declare ``Audio(decode=True)`` -- viVoice and VietSpeech, while VieNeu
+    ships ``decode=False`` and passed -- so ``03_eval_baseline_3ds.ipynb``
+    reported a baseline over 1 of 3 corpora whose caches were all complete.
     """
     corpus = CORPORA[name]
     if corpus.repo is None:
@@ -346,10 +443,20 @@ def check_access(name: str, token: str | None = None) -> tuple[bool, str]:
 
     token = token or os.environ.get("HF_TOKEN")
     try:
-        from datasets import load_dataset
+        from datasets import Audio, load_dataset
+
+        import bench
 
         ds = load_dataset(corpus.repo, corpus.config, split=corpus.split,
                           streaming=True, token=token)
+        try:
+            ds = ds.cast_column(bench.pick_audio_column(ds.features),
+                                Audio(decode=False))
+        except KeyError:
+            # No recognised audio column. That is a real problem, but it is the
+            # build's to report against the whole schema -- the probe's job is
+            # only to say whether the bytes are reachable.
+            pass
         row = next(iter(ds))
         return True, f"{corpus.repo}: ok, columns {sorted(row)}"
     except Exception as exc:                       # noqa: BLE001 - report anything
@@ -401,7 +508,7 @@ def prepare_corpus(name: str, target_hours: float | None = 10.0,
                   for p in paths.values())
     have, have_hours = cached_stamp(base)
     want_hours = hours_tag(target_hours)
-    if on_disk and have == CORPUS_VERSION and have_hours == want_hours:
+    if cache_is_complete(name, target_hours, root):
         print(f"[corpora] {name}: cache hit at {base} "
               f"(v{CORPUS_VERSION}, {want_hours} h).")
         return paths
@@ -446,11 +553,17 @@ def prepare_corpus(name: str, target_hours: float | None = 10.0,
                  mininterval=interval,
                  bar_format="{l_bar}{bar}| {n:.1f}/{total:.1f} min [{elapsed}<{remaining}]"))
 
-    # Streamed, not downloaded: a 1,000 h corpus never lands on disk in full.
+    # Only the shards the hour budget reaches are fetched, so a 1,000 h corpus
+    # still never lands on disk in full -- but the ones that are fetched do stay
+    # in the HF cache, which is what makes a re-run resume instead of restart.
+    # A configured dataset cannot be resolved to shard files, so it keeps the
+    # streaming reader; none of CORPORA uses a config today.
     extra = (corpus.channel_column,) if corpus.channel_column else ()
-    for row in bench.stream_rows(corpus.repo, corpus.split, corpus.config,
-                                 corpus.text_column, token, extra_columns=extra,
-                                 shuffle_seed=seed if corpus.shuffle else None):
+    read = (bench.stream_shards if PREFETCH_SHARDS and corpus.config is None
+            else bench.stream_rows)
+    for row in read(corpus.repo, corpus.split, corpus.config,
+                    corpus.text_column, token, extra_columns=extra,
+                    shuffle_seed=seed if corpus.shuffle else None):
         text = mixture.normalize_train_text(str(row["text"]).strip())
         if not keep_clip(row["duration"], text):
             dropped += 1
@@ -523,9 +636,21 @@ def prepare_all(names, target_hours: float | None = 10.0, root: str = "data/corp
     Returns ``{name: paths}`` for the corpora that are usable. A gated corpus
     awaiting approval is skipped with its error message, so the notebooks run
     end to end on whatever is actually available.
+
+    A corpus that is already built at ``target_hours`` is never probed. The
+    probe exists to predict whether a *build* can fetch its bytes; a finished
+    build has already answered that, and asking again only creates a way for a
+    transient network or environment fault to drop a complete corpus out of an
+    evaluation. Callers should still compare the returned keys against ``names``
+    -- a short dict means the run covers less than it was asked to.
     """
     built = {}
     for name in names:
+        if cache_is_complete(name, target_hours, root):
+            print(f"[corpora] {name}: complete cache at "
+                  f"{corpus_dir(name, root)} — skipping the access probe.")
+            built[name] = prepare_corpus(name, target_hours, root, token, seed)
+            continue
         ok, msg = check_access(name, token)
         if not ok:
             print(f"[corpora] SKIP {name} — {msg}")

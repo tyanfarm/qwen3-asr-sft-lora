@@ -2,14 +2,19 @@
 
 ## Why this test exists
 
-The 300 h run in `04_lora_finetune_3ds.ipynb` trains on **short clips only**.
+The 400 h run in `04_lora_finetune_3ds.ipynb` trains on **short clips only**.
 Measured on the sources it draws from:
 
 | corpus | what the source ships | mean clip |
 |---|---|---|
-| `vivoice_full` | native viVoice clips, unmerged | 3.87 s |
+| `vivoice_full` | native viVoice clips, unmerged | 4.14 s |
 | `vietspeech` | social-media utterances | ~2–6 s |
 | `vieneu` | TTS read speech | short (measure after the build) |
+| `bud500` | fixed-length YouTube chunks, cut mid-phrase | 2.55 s (max 4.46) |
+
+Bud500 makes this sharper, not milder: every one of its 126,326 train clips is under
+5 s, so it is ~37% of the training examples and none of them teach the model
+anything about holding context past a few seconds.
 
 So the adapter never sees a 30 s utterance. The base model did — Qwen3-ASR has no
 architectural length ceiling (1 s conv chunks, 8 s attention windows, 13 audio
@@ -137,7 +142,7 @@ channel, so both variants cover identical audio.
 ## The reference point, and what to expect
 
 From the 34 h run (`checkpoints/vi_lora`), which trained on the merged 5–60 s
-segments — the opposite length distribution to the 300 h run:
+segments — the opposite length distribution to the 400 h run:
 
 | split | bucket | n | base WER % | 34 h LoRA WER % | delta |
 |---|---|---|---|---|---|
@@ -149,7 +154,7 @@ segments — the opposite length distribution to the 300 h run:
 | raw | overall | 1250 | 3.76 | 3.86 | +0.09 |
 
 That run trained long and **regressed on short** (0–5 s, +0.35 pts, the largest
-move in the table). The 300 h run inverts the training distribution, so the
+move in the table). The 400 h run inverts the training distribution, so the
 falsifiable prediction is the mirror image: **0–5 s should improve, and 30–60 s is
 where a regression would show.** If 30–60 s degrades while notebook 4's per-corpus
 WERs all improve, that is the finding — and it is invisible without this test.

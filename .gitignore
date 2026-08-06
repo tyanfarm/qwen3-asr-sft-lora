@@ -16,3 +16,4 @@ models/
 venv/
 *.log
 audio_test/
+docs/

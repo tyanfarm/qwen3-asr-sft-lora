@@ -218,12 +218,12 @@ api.upload_folder(
     repo_id=REPO, folder_path=OUT, repo_type="model",
     allow_patterns=["*.safetensors", "*.json", "*.txt", "README.md"],
     ignore_patterns=["checkpoint-*/*", "training_args.bin", "optimizer.pt"],
-    commit_message="Qwen3-ASR-1.7B merged with Vietnamese LoRA (300 h)",
+    commit_message="Qwen3-ASR-1.7B merged with Vietnamese LoRA (400 h)",
 )
 ```
 
 Name the repo from the hours `mixture.summarize` actually reported in notebook 4,
-not from the 300 h this was planned at.
+not from the 400 h this was planned at.
 
 ## 6 · Serving
 

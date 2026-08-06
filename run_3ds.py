@@ -5,11 +5,15 @@ Jupyter kernel is the wrong place to hold it. Scale, from measurements on this
 box:
 
     disk        115 MB per audio-hour of 16 kHz PCM_16 wav
-    download    74 audio-hours per wall-hour, sustained across a long build
+    download    300 audio-hours per wall-hour on the shard-prefetch path
     training    9.82 examples/s at batch 8
 
-    TARGET_HOURS = 100 per corpus  ->  300 h, ~35 GB, ~4 h to build, ~5 h to train
-    TARGET_HOURS = None            ->  ~2,240 h, ~258 GB, ~30 h to build, ~33 h to train
+    TARGET_HOURS = 100 per corpus  ->  400 h, ~46 GB, ~1.5 h to build, 8.9 h to train
+    TARGET_HOURS = None            ->  ~2,740 h, ~315 GB, ~9 h to build, ~58 h to train
+
+Training time scales with *examples*, not hours, and the four corpora differ in
+clip length by 2.9x -- 100 h is 71,238 viVoice train clips but 126,326 Bud500
+ones. Four corpora at 100 h each is 315,029 training examples (measured).
 
 Keep TARGET_HOURS equal to HOURS_PER_CORPUS in both notebooks. The caches are
 shared and stamped with the hours they were built at, so a mismatch rebuilds
@@ -29,7 +33,7 @@ import sys
 import time
 import traceback
 
-NAMES = ["vivoice_full", "vietspeech", "vieneu"]
+NAMES = ["vivoice_full", "vietspeech", "vieneu", "bud500"]
 NOTEBOOKS = ["03_eval_baseline_3ds.ipynb", "04_lora_finetune_3ds.ipynb"]
 
 TARGET_HOURS = 100.0        # per corpus; None takes each corpus in full
@@ -46,6 +50,12 @@ def build() -> list:
 
     done = []
     for name in NAMES:
+        # A corpus already built at TARGET_HOURS needs nothing from the network,
+        # so it is not probed -- a probe can only fail and lose a finished build.
+        if corpora.cache_is_complete(name, TARGET_HOURS):
+            _stamp(f"{name} — complete cache, nothing to build")
+            done.append(name)
+            continue
         ok, msg = corpora.check_access(name)
         if not ok:
             _stamp(f"SKIP {name} — {msg}")

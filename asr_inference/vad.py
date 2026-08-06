@@ -10,7 +10,10 @@ right).
 Silero VAD is the default because it is a 2 MB ONNX model that runs at ~1% of
 real time on CPU, and it tracks speech rather than loudness, so it survives
 background noise that a dB-threshold splitter would happily transcribe as
-speech. ``split_on_energy`` stays as a dependency-free fallback.
+speech. ``hard_split`` stays as a dependency-free fallback for when VAD is
+unavailable, or when it genuinely finds nothing -- which happens not just on
+silence but on non-speech audio like singing/music, where VAD's speech-ness
+score can stay near zero regardless of threshold.
 
 Two knobs matter and pull against each other:
 
@@ -123,45 +126,41 @@ def merge_segments(segments: list[Segment], *, max_seconds: float = 30.0,
     return [Segment(max(0.0, s.start - pad), min(limit, s.end + pad)) for s in merged]
 
 
-def split_on_energy(samples: np.ndarray, *, max_seconds: float = 30.0,
-                    sample_rate: int = TARGET_SR,
-                    top_db: float = 35.0) -> list[Segment]:
-    """Dependency-free fallback: split at dB minima instead of at speech.
+def hard_split(samples: np.ndarray, *, chunk_seconds: float = 60.0,
+                sample_rate: int = TARGET_SR) -> list[Segment]:
+    """Dependency-free fallback: split into fixed-size chunks, no analysis.
 
-    Used when ``silero-vad`` is not installed. Noticeably worse on noisy audio,
-    where a fan or a road is "loud enough" to look like speech and the chunks
-    end up hard-cut at the ceiling.
+    Used when Silero VAD is unavailable (``silero-vad`` not installed), or when
+    it finds no speech. An empty VAD result is not necessarily silence -- it is
+    also what non-speech audio like singing or music produces, since Silero is
+    trained on conversational speech and its speech-probability score can stay
+    near zero across an entire song regardless of threshold. Rather than guess
+    at boundaries the way ``split_on_energy`` did, this just cuts on a fixed
+    clock: every chunk is exactly ``chunk_seconds`` except the last, which is
+    whatever remains.
     """
-    import librosa
+    total = len(samples) / sample_rate
+    if total <= chunk_seconds:
+        return [Segment(0.0, total)]
 
-    if len(samples) <= max_seconds * sample_rate:
-        return [Segment(0.0, len(samples) / sample_rate)]
-
-    intervals = librosa.effects.split(samples, top_db=top_db)
-    if len(intervals) == 0:
-        intervals = np.array([[0, len(samples)]])
-    spans = [Segment(int(lo) / sample_rate, int(hi) / sample_rate)
-             for lo, hi in intervals]
-
-    # librosa gives no length guarantee, so anything still over the ceiling
-    # after merging has to be hard-cut -- the case VAD avoids.
-    out: list[Segment] = []
-    for seg in merge_segments(spans, max_seconds=max_seconds, pad=0.0):
-        if seg.duration <= max_seconds:
-            out.append(seg)
-            continue
-        n = int(np.ceil(seg.duration / max_seconds))
-        step = seg.duration / n
-        out += [Segment(seg.start + i * step, seg.start + (i + 1) * step)
-                for i in range(n)]
-    return out
+    n_chunks = int(np.ceil(total / chunk_seconds))
+    return [
+        Segment(i * chunk_seconds, min((i + 1) * chunk_seconds, total))
+        for i in range(n_chunks)
+    ]
 
 
 def segment_audio(samples: np.ndarray, sample_rate: int = TARGET_SR, *,
                   max_seconds: float = 30.0, max_gap: float = 0.8,
                   pad: float = 0.2, vad: SileroVAD | None = None,
-                  use_vad: bool = True, progress=None) -> list[Segment]:
-    """Cut audio into decodable chunks: Silero VAD if available, energy if not."""
+                  use_vad: bool = True, chunk_seconds: float = 60.0,
+                  progress=None) -> list[Segment]:
+    """Cut audio into decodable chunks: Silero VAD if available, hard split if not.
+
+    ``chunk_seconds`` only applies to the hard-split fallback path (no VAD, or
+    VAD found nothing) and is independent of ``max_seconds``, which remains the
+    ceiling Silero itself respects when it does find speech.
+    """
     total = len(samples) / sample_rate
     if total <= max_seconds:
         return [Segment(0.0, total)]
@@ -175,8 +174,9 @@ def segment_audio(samples: np.ndarray, sample_rate: int = TARGET_SR, *,
                 return merge_segments(spans, max_seconds=max_seconds,
                                       max_gap=max_gap, pad=pad,
                                       total_seconds=total)
-            return []  # genuinely no speech; do not fall through to energy
+            # VAD ran but found nothing -- could be silence, could be
+            # non-speech audio (music/singing). Fall through to a hard split
+            # rather than assuming there's nothing to transcribe.
         except ImportError:
             pass
-    return split_on_energy(samples, max_seconds=max_seconds,
-                           sample_rate=sample_rate)
+    return hard_split(samples, chunk_seconds=chunk_seconds, sample_rate=sample_rate)
